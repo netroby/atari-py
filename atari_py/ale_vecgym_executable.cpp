@@ -1,20 +1,30 @@
 #include <ale_interface.hpp>
+#include <vector>
 #include <stdarg.h>
 #include <stdint.h>
 #include <time.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 static std::string env_id;
 static std::string rom;
 static std::string monitor_dir;
+static std::string prefix;
 static int LUMP;
 static int cpu;
+static int NCPU;
 static int BUNCH;
-static int SAMPLES;
+static int STEPS;
 static int SKIP;
 static int STACK;
-const int SMALL_PICTURE_BYTES = 105*80;
-const int FULL_PICTURE_BYTES  = 210*160;
+const int W = 80;
+const int H = 105;
+const int SMALL_PICTURE_BYTES =   H*W;
+const int FULL_PICTURE_BYTES  = 210*160; // AKA 2H*2W
 
 std::string stdprintf(const char* fmt, ...)
 {
@@ -35,11 +45,59 @@ double time()
 }
 
 struct UsefulData {
-	std::vector<std::vector<uint8_t> > picture_stack;
-	int picture_rotate;
+	std::vector< std::vector<uint8_t> > picture_stack;
+	int picture_rotation;
 	int lives;
 	int frame;
 	int score;
+};
+
+template<class T>
+class MemMap {
+	int _len;
+public:
+	int fd;
+	T* d;
+	int chunk;
+
+	MemMap(const std::string& fn, int size):
+		_len(0),
+		fd(-1),
+		d(0)
+	{
+		fd = open(fn.c_str(), O_RDWR);
+		if (fd==-1)
+			throw std::runtime_error(stdprintf("cannot open file '%s': %s", fn.c_str(), strerror(errno)));
+		_len = sizeof(T)*size;
+		int file_on_disk_size = lseek(fd, 0, SEEK_END);
+		if (file_on_disk_size != _len) {
+			close(fd);
+			throw std::runtime_error(stdprintf("file on disk '%s' has size %i, but expected size is %i",
+				fn.c_str(), file_on_disk_size, _len) );
+		}
+		d = (T*) mmap(0, _len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+		if (d==MAP_FAILED) {
+			close(fd);
+			throw std::runtime_error(stdprintf("cannot mmap '%s': %s", fn.c_str(), strerror(errno)));
+		}
+		assert( size % (LUMP*NCPU*BUNCH*STEPS) == 0 );
+		chunk = size / (LUMP*NCPU*BUNCH*STEPS);
+	}
+
+	~MemMap()
+	{
+		if (d)
+			munmap(d, _len);
+		if (fd!=-1)
+			close(fd);
+	}
+
+	T* at(int l, int b, int cursor)
+	{
+		return d + chunk*(l*NCPU*BUNCH*STEPS + cpu*BUNCH*STEPS + b*STEPS + cursor);
+	}
+	// shape_with_details    = [LUMP, NENV, STEPS]
+	// NENV = NCPU*BUNCH
 };
 
 void main_loop()
@@ -50,6 +108,19 @@ void main_loop()
         double t0 = time();
         fprintf(monitor_js, "{\"t_start\": %0.2lf, \"gym_version\": \"vecgym\", \"env_id\": \"%s\"}\n", t0, env_id.c_str());
         fflush(monitor_js);
+
+        MemMap<uint8_t> buf_obs0(prefix+"_obs0", LUMP*NCPU*BUNCH*STEPS*H*W*STACK);
+        MemMap<int32_t> buf_acts(prefix+"_acts", LUMP*NCPU*BUNCH*STEPS);
+        MemMap<float>   buf_rews(prefix+"_rews", LUMP*NCPU*BUNCH*STEPS);
+        MemMap<bool>    buf_news(prefix+"_news", LUMP*NCPU*BUNCH*STEPS);
+        MemMap<int32_t> buf_step(prefix+"_step", LUMP*NCPU*BUNCH*STEPS);
+        MemMap<float>   buf_scor(prefix+"_scor", LUMP*NCPU*BUNCH*STEPS);
+
+        MemMap<uint8_t> last_obs0(prefix+"_xlast_obs0", LUMP*NCPU*BUNCH*1*H*W*STACK);
+        MemMap<float>   last_rews(prefix+"_xlast_rews", LUMP*NCPU*BUNCH*1);
+        MemMap<bool>    last_news(prefix+"_xlast_news", LUMP*NCPU*BUNCH*1);
+        MemMap<int32_t> last_step(prefix+"_xlast_step", LUMP*NCPU*BUNCH*1);
+        MemMap<float>   last_scor(prefix+"_xlast_scor", LUMP*NCPU*BUNCH*1);
 
 	std::vector<std::vector<ALEInterface*> > lumps;
 	std::vector<std::vector<UsefulData> > lumps_useful;
@@ -196,22 +267,31 @@ void main_loop()
 int main(int argc, char** argv)
 {
 	fprintf(stderr, "\n\n*************************************** ALE VECGYM **************************************\n");
-	env_id      = argv[1];
-	rom         = argv[2];
-	monitor_dir = argv[3];
-	LUMP    = atoi(argv[4]);
-	cpu     = atoi(argv[5]);
-	BUNCH   = atoi(argv[6]);
-	SAMPLES = atoi(argv[7]);
-	SKIP    = atoi(argv[8]);
-	STACK   = atoi(argv[9]);
-	fprintf(stderr, "C++ LUMP=%i cpu=%i BUNCH=%i SAMPLES=%i SKIP=%i STACK=%i\n",
+	if (argc < 12) {
+		fprintf(stderr, "I need more command line arguments!\n");
+		return 1;
+	}
+	prefix      = argv[1];
+	env_id      = argv[2];
+	rom         = argv[3];
+	monitor_dir = argv[4];
+	LUMP    = atoi(argv[5]);
+	cpu     = atoi(argv[6]);
+	NCPU    = atoi(argv[7]);
+	BUNCH   = atoi(argv[8]);
+	STEPS   = atoi(argv[9]);
+	SKIP    = atoi(argv[10]);
+	STACK   = atoi(argv[11]);
+
+	fprintf(stderr, "C++ LUMP=%i cpu=%i/CPU=%i BUNCH=%i STEPS=%i SKIP=%i STACK=%i\n",
 		LUMP,
 		cpu,
+		NCPU,
 		BUNCH,
-		SAMPLES,
+		STEPS,
 		SKIP,
 		STACK);
+	fprintf(stderr, "     prefix: %s\n", prefix.c_str());
 	fprintf(stderr, "monitor dir: %s\n", monitor_dir.c_str());
 	fprintf(stderr, "        rom: %s\n", rom.c_str());
 	main_loop();
