@@ -25,6 +25,40 @@ const int W = 80;
 const int H = 105;
 const int SMALL_PICTURE_BYTES =   H*W;
 const int FULL_PICTURE_BYTES  = 210*160; // AKA 2H*2W
+static int fd_p2c_r;
+static int fd_c2p_w;
+
+void resize_05x_grayscale(uint8_t* dst, uint8_t* src, int H, int W)
+{
+	for (int y=0; y<H; y++) {
+		for (int x=0; x<W; x++) {
+			dst[y*W+x] =
+				(src[(y+0)*2*W + 2*(x+0)] >> 2) +
+				(src[(y+0)*2*W + 2*(x+1)] >> 2) +
+				(src[(y+1)*2*W + 2*(x+0)] >> 2) +
+				(src[(y+1)*2*W + 2*(x+1)] >> 2);
+		}
+	}
+}
+
+void resize_05x_grayscale_two_sources(uint8_t* dst, uint8_t* src1, uint8_t* src2, int H, int W)
+{
+	for (int y=0; y<H; y++) {
+		for (int x=0; x<W; x++) {
+			uint8_t v1 =
+				(src1[(y+0)*2*W + 2*(x+0)] >> 2) +
+				(src1[(y+0)*2*W + 2*(x+1)] >> 2) +
+				(src1[(y+1)*2*W + 2*(x+0)] >> 2) +
+				(src1[(y+1)*2*W + 2*(x+1)] >> 2);
+			uint8_t v2 =
+				(src2[(y+0)*2*W + 2*(x+0)] >> 2) +
+				(src2[(y+0)*2*W + 2*(x+1)] >> 2) +
+				(src2[(y+1)*2*W + 2*(x+0)] >> 2) +
+				(src2[(y+1)*2*W + 2*(x+1)] >> 2);
+			dst[y*W+x] = std::max(v1, v2); // TODO: use some crazy http://www.geeksforgeeks.org/compute-the-minimum-or-maximum-max-of-two-integers-without-branching/
+		}
+	}
+}
 
 std::string stdprintf(const char* fmt, ...)
 {
@@ -46,7 +80,7 @@ double time()
 
 struct UsefulData {
 	std::vector< std::vector<uint8_t> > picture_stack;
-	int picture_rotation;
+	int picture_rot;
 	int lives;
 	int frame;
 	int score;
@@ -80,7 +114,12 @@ public:
 			close(fd);
 			throw std::runtime_error(stdprintf("cannot mmap '%s': %s", fn.c_str(), strerror(errno)));
 		}
-		assert( size % (LUMP*NCPU*BUNCH*STEPS) == 0 );
+		if (size % (LUMP*NCPU*BUNCH)) {
+			close(fd);
+			throw std::runtime_error(stdprintf("cannot divide size=%i by LUMP*NCPU*BUNCH*STEPS for '%s'",
+				size,
+				fn.c_str()));
+		}
 		chunk = size / (LUMP*NCPU*BUNCH*STEPS);
 	}
 
@@ -109,6 +148,7 @@ void main_loop()
         fprintf(monitor_js, "{\"t_start\": %0.2lf, \"gym_version\": \"vecgym\", \"env_id\": \"%s\"}\n", t0, env_id.c_str());
         fflush(monitor_js);
 
+	//printf("cpu%i AAAAAAAAAAAAAAAAAAAAAAAAAA\n", cpu);
         MemMap<uint8_t> buf_obs0(prefix+"_obs0", LUMP*NCPU*BUNCH*STEPS*H*W*STACK);
         MemMap<int32_t> buf_acts(prefix+"_acts", LUMP*NCPU*BUNCH*STEPS);
         MemMap<float>   buf_rews(prefix+"_rews", LUMP*NCPU*BUNCH*STEPS);
@@ -124,8 +164,10 @@ void main_loop()
 
 	std::vector<std::vector<ALEInterface*> > lumps;
 	std::vector<std::vector<UsefulData> > lumps_useful;
+	std::vector<uint8_t> full_res_buf1(FULL_PICTURE_BYTES);
+	std::vector<uint8_t> full_res_buf2(FULL_PICTURE_BYTES);
+	std::vector<Action> action_set;
 	int cursor = 0;
-	int me = cpu*BUNCH;
 	for (int l=0; l<LUMP; l++) {
 		std::vector<ALEInterface*> bunch;
 		std::vector<UsefulData> bunch_useful;
@@ -133,140 +175,170 @@ void main_loop()
 			ALEInterface* emu = new ALEInterface();
 			emu->setInt("random_seed", cpu*1000 + b);
 			emu->loadROM(rom);
+			action_set = emu->getMinimalActionSet();
 			assert( FULL_PICTURE_BYTES == emu->getScreen().height() * emu->getScreen().width() );
-			UsefulData d;
-			d.frame = 0;
-			d.score = 0;
-			d.lives = emu->lives();
+			UsefulData data;
+			data.frame = 0;
+			data.score = 0;
+			data.lives = emu->lives();
+			for (int s=0; s<STACK; s++)
+				data.picture_stack.push_back(std::vector<uint8_t>(W*H));
+			emu->getScreenGrayscale(full_res_buf1);
+			resize_05x_grayscale(data.picture_stack[0].data(), full_res_buf1.data(), H, W);
+			for (int s=1; s<STACK; s++) {
+				memcpy(data.picture_stack[s].data(), data.picture_stack[0].data(), W*H);
+				memcpy(buf_obs0.at(l,b,cursor) + s*W*H, data.picture_stack[0].data(), W*H);
+			}
+			data.picture_rot = 0;
 			bunch.push_back(emu);
-			bunch_useful.push_back(d);
-			fprintf(stderr, "AAAAAA\n");
+			bunch_useful.push_back(data);
+			buf_rews.at(l,b,cursor)[0] = 0;
+			buf_news.at(l,b,cursor)[0] = true;
+			buf_step.at(l,b,cursor)[0] = 0;
+			buf_scor.at(l,b,cursor)[0] = 0;
 		}
 		lumps.push_back(bunch);
 		lumps_useful.push_back(bunch_useful);
 	}
 
+	ssize_t r0 = write(fd_c2p_w, "R", 1);
+	assert(r0==1); // pipe must block until it can write, not return errors.
+	for (int l=0; l<LUMP; l++) {
+		char buf[1];
+		buf[0] = 'a' + l;
+		ssize_t r0 = write(fd_c2p_w, buf, 1);
+		assert(r0==1);
+	}
+        cursor += 1;
+        bool quit = false;
+        while (!quit) {
+		bool last = cursor==STEPS;
+		for (int l=0; l<LUMP; l++) {
+			std::vector<ALEInterface*>& bunch = lumps[l];
+			std::vector<UsefulData>& bunch_useful = lumps_useful[l];
+			char cmd[2];
+			//printf(" * * * * cpu%i rcv!\n", cpu);
+			ssize_t r1 = read(fd_p2c_r, cmd, 1);
+			//printf(" * * * * cpu%i cmd='%c'\n", cpu, cmd[0]);
+			if (r1 != 1) {
+				fprintf(stderr, "ale_vecgym_executable cpu%02i quit because of closed pipe (1)\n", cpu);
+				return;
+			}
+			if (cmd[0]=='Q') return; // quit, but silently
+			if (cmd[0] >= 'A' && cmd[0] <= 'H') { // 'H' is 8 lumps supported (ABCDEFGH)
+				cursor = 0;
+				assert(cmd[0]=='A' && "you have synchronization problems"); // but actually, it only makes sense to send 'A' there
+			} else if (cmd[0] >= 'a' && cmd[0] <= 'h') {
+				assert(cmd[0]==char(97+l) && "you have synchronization problems");
+			} else {
+				fprintf(stderr, "ale_vecgym_executable cpu%02i something strange visible in a pipe: '%c', let's quit just in case...\n", cpu, cmd[0]);
+				return;
+			}
+	                assert(cursor < STEPS || last);
+			for (int b=0; b<BUNCH; b++) {
+				ALEInterface* emu = bunch[b];
+				UsefulData& data = bunch_useful[b];
+				Action ale_action = action_set[buf_acts.at(l,b,cursor-1)[0]];
+				bool done = false;
+				int  rew = 0;
+				for (int s=0; s<SKIP; s++) {
+					//printf(" * * * * cpu%i skip\n", cpu);
+					int r = emu->act(ale_action);
+					rew  += r;
+					data.frame += 1;
+					data.score += r;
+					done |= emu->game_over();
+					if (done) break;
+					if (s==SKIP-1) emu->getScreenGrayscale(full_res_buf1);
+					if (s==SKIP-2) emu->getScreenGrayscale(full_res_buf2);
+				}
+				bool reset_me = done;
+				if (!done) {
+					//printf(" * * * * cpu%i rescale1\n", cpu);
+					resize_05x_grayscale_two_sources(data.picture_stack[data.picture_rot].data(), full_res_buf1.data(), full_res_buf2.data(), H, W);
+					data.picture_rot += 1;
+					data.picture_rot %= STACK;
+					for (int s=0; s<STACK; s++) {
+						int rot = (data.picture_rot + s) % STACK;
+						if (!last) {
+							memcpy(buf_obs0.at(l,b,cursor) + s*W*H, data.picture_stack[rot].data(), W*H);
+						} else {
+							memcpy(last_obs0.at(l,b,0) + s*W*H, data.picture_stack[rot].data(), W*H);
+						}
+					}
+					//printf(" * * * * cpu%i rescale2\n", cpu);
+				}
+				int lives = emu->lives();
+				done |= lives < data.lives && lives > 0;
+				bool life_lost = lives < data.lives;
+				if (life_lost) rew = -1;
+				data.lives = lives;
+				//if env.__frame >= limit
+
+				if (!last) {
+					buf_rews.at(l,b,cursor)[0] = rew;
+					buf_news.at(l,b,cursor)[0] = done;
+					buf_scor.at(l,b,cursor)[0] = data.score;
+					buf_step.at(l,b,cursor)[0] = data.frame;
+				} else {
+					last_rews.at(l,b,0)[0] = rew;
+					last_news.at(l,b,0)[0] = done;
+					last_scor.at(l,b,0)[0] = data.score;
+					last_step.at(l,b,0)[0] = data.frame;
+				}
+				if (0 && cpu==0 && b==0 && l==0) {
+					//fprintf(stderr, "%c", cmd[0]);
+					//fflush(stderr);
+					fprintf(stderr, " frame %06i/%06i lives %i act %i total rew %i done %i\n",
+						data.frame, 0, lives, int(ale_action),
+						data.score, done);
+				}
+
+				if (!reset_me) continue;
+				fprintf(monitor_js, "{\"r\": %i, \"l\": %i, \"t\": %0.2lf} )\n",
+					data.score, data.frame, time() - t0);
+				fflush(monitor_js);
+				data.frame = 0;
+				data.score = 0;
+				data.lives = 0;
+				emu->reset_game();
+				emu->getScreenGrayscale(full_res_buf1);
+				resize_05x_grayscale(data.picture_stack[0].data(), full_res_buf1.data(), H, W);
+				for (int s=1; s<STACK; s++) {
+					memcpy(data.picture_stack[s].data(), data.picture_stack[0].data(), W*H);
+					memcpy(buf_obs0.at(l,b,cursor) + s*W*H, data.picture_stack[0].data(), W*H);
+				}
+				data.picture_rot = 0;
+				for (int s=0; s<STACK; s++) {
+					int rot = (data.picture_rot + s) % STACK;
+					if (!last) {
+						memcpy(buf_obs0.at(l,b,cursor) + s*W*H, data.picture_stack[rot].data(), W*H);
+					} else {
+						memcpy(last_obs0.at(l,b,0) + s*W*H, data.picture_stack[rot].data(), W*H);
+					}
+				}
+				// But keep the rewards, step, score
+			}
+			char buf[1];
+			buf[0] = 'a' + l;
+			ssize_t r2 = write(fd_c2p_w, buf, 1);
+			//printf(" * * * * cpu%i SENT\n", cpu);
+			if (r2 != 1) {
+				fprintf(stderr, "ale_vecgym_executable cpu%02i quit because of closed pipe (2)\n", cpu);
+				return;
+			}
+		}
+		cursor += 1;
+	}
 	fclose(monitor_js);
-
-	// open shared
-	// open pipe
-
-//                env.__stacked_pictures = [obs]*STACK
-//                for s in range(STACK):
-//                    vecenv.buf_l_obs[0][l,me+b,cursor,:,:,s] = env.__stacked_pictures[s]
-//                vecenv.buf_l_vo[0][l,me+b,cursor] = 1 - env.__frame/limit
-//                vecenv.buf_l_rews[l,me+b,cursor] = 0
-//                vecenv.buf_l_news[l,me+b,cursor] = True
-
-//        pipe.send("ready")
-//        for l in range(LUMP): pipe.send(l)
-//        cursor += 1
-//        quit = False
-//        while not quit:
-//            last = cursor==STEPS
-//            for l in range(LUMP):
-//                bunch = lumps[l]
-//                sync_check, cmd = pipe.recv()   # Wait for action
-//                quit |= cmd=='Q'
-//                if quit: break
-//                if cmd=='0':
-//                    cursor = 0
-//                    assert l==0
-//                elif cmd=='S':
-//                    pass
-//                else:
-//                    assert 0, "Something strange came to me through pipe: '%s'" % cmd
-//                assert cursor < STEPS or last
-//                assert sync_check==l
-//                for b in range(BUNCH):
-//                    env = bunch[b]
-//                    life_lost = False
-//                    ale_action = env.unwrapped._action_set[vecenv.buf_l_acts[l,me+b,cursor-1]]
-//                    done = False
-//                    rew  = 0
-//                    raw_pictures = []
-//                    for s in range(SKIP):
-//                        r = env.unwrapped.ale.act(ale_action)
-//                        rew += r
-//                        env.__reward += r
-//                        done |= env.unwrapped.ale.game_over()
-//                        if done: break
-//                        if s >= SKIP-2:
-//                            raw_pictures.append( env.unwrapped.ale.getScreenRGB2() )
-//                    reset_me = done
-
-//                    if not reset_me:
-//                        assert len(raw_pictures)==2
-//                        picture = np.dot(np.maximum(
-//                            resize_05x(raw_pictures[0]),
-//                            resize_05x(raw_pictures[1]),
-//                            ).astype('float32'), make_grayscale).astype('uint8')
-//                        env.__stacked_pictures.append( picture )
-//                        env.__stacked_pictures.pop(0)
-//                        if not last:
-//                            for s in range(STACK):
-//                                vecenv.buf_l_obs[0][l,me+b,cursor,:,:,s] = env.__stacked_pictures[s]
-//                        else:
-//                            for s in range(STACK):
-//                                vecenv.buf_obs_last[0][l,me+b,0,:,:,s] = env.__stacked_pictures[s]
-
-//                    env.__frame += SKIP
-//                    lives = env.unwrapped.ale.lives()
-//                    if lives < env.__lives and lives > 0:
-//                        done = True
-//                    if lives < env.__lives:
-//                        life_lost = True
-//                    env.__lives = lives
-
-//                    if env.__frame >= limit:
-//                        reset_me = True
-
-//                    if not last:
-//                        vecenv.buf_l_rews[l,me+b,cursor] = rew
-//                        vecenv.buf_l_news[l,me+b,cursor] = done
-//                        vecenv.buf_l_scor[l,me+b,cursor] = env.__reward
-//                        vecenv.buf_l_step[l,me+b,cursor] = env.__frame
-//                        vecenv.buf_l_vo[0][l,me+b,cursor] = 1 - env.__frame/limit
-//                    else:
-//                        vecenv.buf_rews_last[l,me+b,0] = rew
-//                        vecenv.buf_scor_last[l,me+b,0] = env.__reward
-//                        vecenv.buf_step_last[l,me+b,0] = env.__frame
-//                        vecenv.buf_vo_last[0][l,me+b,0] = 1 - env.__frame/limit
-
-//                    #if cpu==0 and b==0 and l==0:
-//                    #    sys.stdout.write('.' if not done else 'd')
-//                    #    sys.stdout.flush()
-//                    #    print("%s frame %06i/%06i lives %i act %i total rew %06.0f done %i" % (id(env.unwrapped),
-//                    #        env.__frame, limit, lives, ale_action,
-//                    #        env.__reward, done))
-//                    if not reset_me: continue
-//                    monitor_js.write(json.dumps( {"r": env.__reward, "l": env.__frame, "t": time.time() - vecenv.t0} )+"\n")
-//                    monitor_js.flush()
-//                    env.__frame  = 0
-//                    env.__reward = 0
-//                    env.__lives = 0
-//                    env.__was_real_done  = False
-//                    obs = np.dot(resize_05x( env.reset() ).astype('float32'), make_grayscale).astype('uint8')
-//                    env.__stacked_pictures = [obs]*STACK
-//                    if not last:
-//                        for s in range(STACK):
-//                            vecenv.buf_l_obs[0][l,me+b,cursor,:,:,s] = env.__stacked_pictures[s]
-//                        assert vecenv.buf_l_news[l,me+b,cursor]==True
-//                    else:
-//                        for s in range(STACK):
-//                            vecenv.buf_obs_last[0][l,me+b,0,:,:,s] = env.__stacked_pictures[s]
-//                    # But keep the rewards, step, score
-
-//                pipe.send(l)
-//            cursor += 1
-//    finally:
-//        pipe.send(None)
-//        pipe.close()
+	close(fd_c2p_w);
+	close(fd_p2c_r);
 }
 
 int main(int argc, char** argv)
 {
-	fprintf(stderr, "\n\n*************************************** ALE VECGYM **************************************\n");
+	ale::Logger::setMode(ale::Logger::Warning);
+	fprintf(stderr, "\n*************************************** ALE VECGYM **************************************\n");
 	if (argc < 12) {
 		fprintf(stderr, "I need more command line arguments!\n");
 		return 1;
@@ -282,7 +354,8 @@ int main(int argc, char** argv)
 	STEPS   = atoi(argv[9]);
 	SKIP    = atoi(argv[10]);
 	STACK   = atoi(argv[11]);
-
+	fd_p2c_r   = atoi(argv[12]);
+	fd_c2p_w   = atoi(argv[13]);
 	fprintf(stderr, "C++ LUMP=%i cpu=%i/CPU=%i BUNCH=%i STEPS=%i SKIP=%i STACK=%i\n",
 		LUMP,
 		cpu,
@@ -291,6 +364,7 @@ int main(int argc, char** argv)
 		STEPS,
 		SKIP,
 		STACK);
+	fprintf(stderr, "        fds: p2c_r=%i c2p_w=%i\n", fd_p2c_r, fd_c2p_w);
 	fprintf(stderr, "     prefix: %s\n", prefix.c_str());
 	fprintf(stderr, "monitor dir: %s\n", monitor_dir.c_str());
 	fprintf(stderr, "        rom: %s\n", rom.c_str());
